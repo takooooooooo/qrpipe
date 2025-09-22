@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QR Code File Receiver</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 2rem; background-color: #f0f0f0; }
+        #video { width: 300px; height: 300px; border: 1px solid #ccc; background-color: #000; }
+        .status { margin: 1rem 0; width: 300px; }
+        #progressBar { width: 100%; }
+        #downloadContainer a { display: block; padding: 10px; background-color: #28a745; color: white; text-align: center; text-decoration: none; border-radius: 5px; margin-top: 1rem; }
+        #logText { width: 300px; height: 100px; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+    <h1>QRコード ファイル受信</h1>
+
+    <video id="video" autoplay playsinline></video>
+    
+    <div class="status">
+        <p id="statusText">カメラをQRコードに向けてください</p>
+        <progress id="progressBar" value="0" max="100"></progress>
+        <p id="bitrateText">転送速度: - kbps</p>
+    </div>
+
+    <div id="downloadContainer"></div>
+
+    <textarea id="logText" readonly placeholder="受信ログ..."></textarea>
+
+    <script src="common.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const video = document.getElementById('video');
+            const statusText = document.getElementById('statusText');
+            const progressBar = document.getElementById('progressBar');
+            const downloadContainer = document.getElementById('downloadContainer');
+            const logText = document.getElementById('logText');
+            const bitrateText = document.getElementById('bitrateText'); // Get bitrate element
+
+            let receivedChunks = [];
+            let totalChunks = 0;
+            let receivedCount = 0;
+            let stream = null;
+            let animationFrameId = null;
+            
+            let worker = null;
+            let isWorkerBusy = false;
+            let startTime = 0; // Timer start
+
+            // Base64をUint8Arrayに変換するヘルパー
+            function base64ToUint8Array(base64) {
+                const binaryString = atob(base64);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                return bytes;
+            }
+
+            function startScan() {
+                log('Web Workerを初期化しています...');
+                worker = new Worker('qr_worker.js');
+                log('Web Workerを初期化しました。');
+
+                worker.onmessage = (event) => {
+                    isWorkerBusy = false; // Workerが手空きになったことを記録
+                    if (event.data.found) {
+                        // log('WorkerからQRデータを受信。'); // 成功時ログはhandleQrCodeに集約
+                        handleQrCode(event.data.data);
+                    }
+                };
+
+                log('カメラにアクセスしています...');
+                navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+                    .then(mediaStream => {
+                        log('カメラへのアクセスに成功。');
+                        stream = mediaStream;
+                        video.srcObject = stream;
+                        video.onloadedmetadata = () => {
+                            video.play();
+                            const canvas = document.createElement('canvas');
+                            const context = canvas.getContext('2d', { willReadFrequently: true });
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            
+                            animationFrameId = requestAnimationFrame(() => tick(context, canvas));
+                            log('スキャンを開始しました。');
+                        };
+                    })
+                    .catch(err => {
+                        console.error("カメラアクセスエラー:", err);
+                        statusText.textContent = "カメラにアクセスできませんでした。";
+                        log(`エラー: ${err.message}`);
+                    });
+            }
+
+            function tick(context, canvas) {
+                if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                    if (!isWorkerBusy) {
+                        isWorkerBusy = true;
+                        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                        worker.postMessage(imageData, [imageData.data.buffer]);
+                        // log('フレームをWorkerに送信。'); // 送信ログは多すぎるのでコメントアウト
+                    }
+                }
+
+                if (receivedCount < totalChunks || totalChunks === 0) {
+                   animationFrameId = requestAnimationFrame(() => tick(context, canvas));
+                }
+            }
+            
+            function log(message) {
+                const time = new Date().toLocaleTimeString();
+                logText.value += `[${time}] ${message}\n`;
+                logText.scrollTop = logText.scrollHeight;
+            }
+
+            function handleQrCode(data) {
+                try {
+                    const chunk = JSON.parse(data);
+                    if (typeof chunk.i !== 'number' || typeof chunk.t !== 'number' || typeof chunk.d !== 'string') {
+                        log(`不正な形式のQRデータを無視: ${data}`)
+                        return;
+                    }
+
+                    if (totalChunks === 0) {
+                        startTime = Date.now(); // 最初のチャンクでタイマーを開始
+                        log('タイマーを開始しました。');
+                        totalChunks = chunk.t;
+                        receivedChunks = new Array(totalChunks);
+                        progressBar.max = totalChunks;
+                        log(`受信開始。総チャンク数: ${totalChunks}`);
+                    }
+
+                    if (chunk.t !== totalChunks) {
+                        log(`別のファイル(総チャンク数${chunk.t})を受信したためリセットします。`);
+                        reset();
+                        return;
+                    }
+
+                    if (receivedChunks[chunk.i] === undefined) {
+                        receivedChunks[chunk.i] = chunk.d;
+                        receivedCount++;
+                        
+                        progressBar.value = receivedCount;
+                        statusText.textContent = `${receivedCount}/${totalChunks} 受信中...`;
+                        log(`チャンク ${chunk.i + 1}/${totalChunks} を受信`);
+
+                        if (receivedCount === totalChunks) {
+                            completeReception();
+                        }
+                    } else {
+                        // log(`重複したチャンク ${chunk.i + 1} を無視しました。`); // 重複ログは多すぎるのでコメントアウト
+                    }
+                } catch (e) {
+                    log(`JSONパースエラー。無視します。データ: ${data}`);
+                }
+            }
+            
+            function reset() {
+                log('状態をリセットします。');
+                if (worker) {
+                    worker.terminate();
+                }
+                // スキャンプロセスを再初期化
+                startScan(); 
+                isWorkerBusy = false;
+                receivedChunks = [];
+                totalChunks = 0;
+                receivedCount = 0;
+                startTime = 0; // タイマーをリセット
+                progressBar.value = 0;
+                statusText.textContent = 'カメラをQRコードに向けてください';
+                downloadContainer.innerHTML = '';
+                bitrateText.textContent = '転送速度: - kbps'; // 転送速度表示をリセット
+            }
+
+            function completeReception() {
+                const endTime = Date.now(); // タイマーを停止
+                log('全チャンク受信完了！タイマーを停止しました。');
+                statusText.textContent = '受信完了！ファイルを生成中...';
+
+                if (animationFrameId) {
+                    cancelAnimationFrame(animationFrameId);
+                    animationFrameId = null;
+                }
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                    log('カメラを停止しました。');
+                }
+                if (worker) {
+                    worker.terminate();
+                    worker = null;
+                    log('Workerを停止しました。');
+                }
+
+                setTimeout(() => {
+                    try {
+                        log('ファイルデータを再構築しています...');
+                        const fullBase64 = receivedChunks.join('');
+                        const fileData = base64ToUint8Array(fullBase64);
+                        const blob = new Blob([fileData], { type: 'application/pdf' }); 
+                        const url = URL.createObjectURL(blob);
+
+                        // 転送速度を計算して表示
+                        const elapsedTime = (endTime - startTime) / 1000; // 秒
+                        const fileSizeInBytes = blob.size;
+                        if (elapsedTime > 0) {
+                            const kbps = (fileSizeInBytes * 8 / elapsedTime) / 1000;
+                            bitrateText.textContent = `転送速度: ${kbps.toFixed(2)} kbps`;
+                            log(`転送完了: ${fileSizeInBytes} bytes in ${elapsedTime.toFixed(2)}s (${kbps.toFixed(2)} kbps)`);
+                        }
+
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'downloaded_file.pdf'; 
+                        a.textContent = 'ファイルをダウンロード';
+                        
+                        downloadContainer.innerHTML = '';
+                        downloadContainer.appendChild(a);
+
+                        statusText.textContent = 'ダウンロード準備完了';
+                        log('ダウンロードリンクを生成しました。');
+                    } catch (e) {
+                        console.error('ファイル復元エラー:', e);
+                        statusText.textContent = 'ファイルの復元に失敗しました。';
+                        log(`エラー: ${e.message}`);
+                    }
+                }, 50);
+            }
+
+            // 初期化
+            startScan();
+        });
+    </script>
+</body>
+</html>
