@@ -1,190 +1,166 @@
-
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QR Code File Transmitter</title>
-    <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 2rem; background-color: #f0f0f0; }
-        #qrcodeContainer { margin: 1rem 0; width: 300px; height: 300px; border: 1px solid #ccc; background-color: #fff; display: flex; justify-content: center; align-items: center; }
-        #qrcodeContainer img { max-width: 100%; max-height: 100%; }
-        .controls, .status { margin: 0.5rem 0; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QR Code File Transmitter</title>
+<style>
+body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 2rem; background-color: #f0f0f0; }
+#qrcodeContainer { margin: 1rem 0; width: 300px; height: 300px; border: 1px solid #ccc; background-color: #fff; display: flex; justify-content: center; align-items: center; }
+#qrcodeContainer img { max-width: 100%; max-height: 100%; }
+.controls, .status { margin: 0.5rem 0; }
+</style>
 </head>
 <body>
-    <h1>QRコード ファイル送信</h1>
+<h1>QRコード ファイル送信</h1>
 
-    <div class="controls">
-        <input type="file" id="fileInput">
-    </div>
+<div class="controls">
+    <input type="file" id="fileInput">
+</div>
 
-    <div id="qrcodeContainer">
-        <p>ここにQRコードが表示されます</p>
-    </div>
+<div id="qrcodeContainer">
+    <p>ここにQRコードが表示されます</p>
+</div>
 
-    <div class="controls">
-        <button id="startButton" disabled>送信開始</button>
-        <button id="stopButton" disabled>送信停止</button>
-    </div>
+<div class="controls">
+    <button id="startButton" disabled>送信開始</button>
+    <button id="stopButton" disabled>送信停止</button>
+</div>
 
-    <div class="status">
-        <p id="statusText">ファイルを選択してください</p>
-        <p id="bitrateText">転送速度: - kbps</p>
-    </div>
+<div class="status">
+    <p id="statusText">ファイルを選択してください</p>
+    <p id="bitrateText">転送速度: - kbps</p>
+</div>
 
-    <script src="https://cdn.jsdelivr.net/npm/qrcode-generator/qrcode.js"></script>
-    <script src="common.js"></script>
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            const fileInput = document.getElementById('fileInput');
-            const startButton = document.getElementById('startButton');
-            const stopButton = document.getElementById('stopButton');
-            const qrcodeContainer = document.getElementById('qrcodeContainer');
-            const statusText = document.getElementById('statusText');
-            const bitrateText = document.getElementById('bitrateText');
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator/qrcode.js"></script>
+<script src="common.js"></script>
+<script>
+// CRC32 計算
+const crcTable = (() => { let c; const table = []; for (let n=0;n<256;n++){c=n;for(let k=0;k<8;k++){c=((c&1)?(0xEDB88320^(c>>>1)):(c>>>1));}table[n]=c;} return table; })();
+const crc32 = (str) => { let crc=0^(-1); for(let i=0;i<str.length;i++){crc=(crc>>>8)^crcTable[(crc^str.charCodeAt(i))&0xFF];} return (crc^(-1))>>>0; };
 
-            let fileBuffer = null;
-            let chunks = [];
-            let qrCodeCache = []; // QRコードのキャッシュ
-            let currentIndex = 0;
-            let transmissionIntervalId = null;
-            let isTransmitting = false;
-            let selectedFile = null;
-            let startTime = 0;
+// ArrayBuffer → Base64 安全変換
+function arrayBufferToBase64(buffer){
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000; // 32KBずつ処理
+    for (let i=0; i<bytes.length; i+=chunkSize){
+        const sub = bytes.subarray(i, i+chunkSize);
+        binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoa(binary);
+}
 
-            fileInput.addEventListener('change', () => {
-                selectedFile = fileInput.files[0];
-                if (selectedFile) {
-                    startButton.disabled = false;
-                    statusText.textContent = `ファイル選択中: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`;
-                }
-            });
+document.addEventListener('DOMContentLoaded', () => {
+    const fileInput = document.getElementById('fileInput');
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const qrcodeContainer = document.getElementById('qrcodeContainer');
+    const statusText = document.getElementById('statusText');
+    const bitrateText = document.getElementById('bitrateText');
 
-            startButton.addEventListener('click', () => {
-                if (!selectedFile) {
-                    alert('まずファイルを選択してください。');
-                    return;
-                }
-                startTransmission();
-            });
+    let base64Data = "", chunks=[], qrCodeCache=[], currentIndex=0, transmissionIntervalId=null, isTransmitting=false;
+    let selectedFile=null, startTime=0, worker=null;
 
-            stopButton.addEventListener('click', () => {
-                stopTransmission();
-            });
+    fileInput.addEventListener('change', () => {
+        selectedFile = fileInput.files[0];
+        if(selectedFile){ 
+            startButton.disabled=false; 
+            statusText.textContent=`ファイル選択中: ${selectedFile.name} (${(selectedFile.size/1024).toFixed(2)} KB)`;
+            console.log(`File selected: ${selectedFile.name}, size=${selectedFile.size}`);
+        }
+    });
 
-            function startTransmission() {
-                isTransmitting = true;
-                startButton.disabled = true;
-                stopButton.disabled = false;
-                statusText.textContent = 'ファイルの読み込み中...';
+    startButton.addEventListener('click', () => { 
+        if(!selectedFile){ alert('ファイル選択してください'); return;} 
+        startTransmission(); 
+    });
 
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    fileBuffer = e.target.result;
-                    createChunks();
-                    
-                    statusText.textContent = `QRコードを生成中... (0/${chunks.length})`;
-                    // UIの更新を待ってから重い処理を開始
-                    setTimeout(async () => {
-                        try {
-                            await generateAllQRCodes();
-                            currentIndex = 0;
-                            startTime = Date.now();
-                            startQrDisplay();
-                        } catch (error) {
-                            // エラー処理はgenerateAllQRCodes内で行われる
-                        }
-                    }, 100);
-                };
-                reader.readAsArrayBuffer(selectedFile);
+    stopButton.addEventListener('click', stopTransmission);
+
+    function startTransmission(){
+        startButton.disabled=true; stopButton.disabled=false; statusText.textContent='ファイルの読み込み中...';
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const fileBuffer = e.target.result;
+            base64Data = arrayBufferToBase64(fileBuffer); // 安全変換
+            console.log(`base64Data length=${base64Data.length}`); // デバッグ
+            createChunks(base64Data);
+            generateAllQRCodesViaWorker();
+        };
+        reader.readAsArrayBuffer(selectedFile);
+    }
+
+    function stopTransmission(){
+        isTransmitting=false;
+        if(transmissionIntervalId) clearInterval(transmissionIntervalId);
+        if(worker){ worker.terminate(); worker=null; }
+        startButton.disabled=false; stopButton.disabled=true;
+        statusText.textContent='送信停止'; 
+        bitrateText.textContent='転送速度: - kbps';
+        console.log("Transmission stopped.");
+    }
+
+    function createChunks(base64Str){
+        chunks = [];
+        const totalChunks = Math.ceil(base64Str.length / PROTOCOL_CONFIG.PAYLOAD_SIZE);
+        console.log(`Creating ${totalChunks} chunks, each max ${PROTOCOL_CONFIG.PAYLOAD_SIZE} chars`);
+        for(let i=0; i<totalChunks; i++){
+            const part = base64Str.substring(i*PROTOCOL_CONFIG.PAYLOAD_SIZE, (i+1)*PROTOCOL_CONFIG.PAYLOAD_SIZE);
+            if(part.length === 0) console.warn(`Warning: chunk ${i} is empty`);
+            const checksum = crc32(part);
+            chunks.push(JSON.stringify({i:i,t:totalChunks,d:part,c:checksum,n:selectedFile.name,m:selectedFile.type}));
+        }
+        console.log(`Chunks created: ${chunks.length}`);
+    }
+
+    function generateAllQRCodesViaWorker(){
+        statusText.textContent='QRコード生成Workerを準備中...';
+        worker = new Worker('transmitter_worker.js');
+        worker.onmessage = (event) => {
+            const {type, progress, total, cache, message} = event.data;
+            if(type==='progress'){ 
+                statusText.textContent=`QRコード生成中... (${progress}/${total})`; 
             }
-
-            function stopTransmission() {
-                isTransmitting = false;
-                if (transmissionIntervalId) {
-                    clearInterval(transmissionIntervalId);
-                    transmissionIntervalId = null;
-                }
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                statusText.textContent = '送信停止。';
-                bitrateText.textContent = '転送速度: - kbps';
+            else if(type==='complete'){ 
+                qrCodeCache = cache; 
+                statusText.textContent='QRコード生成完了。送信開始'; 
+                isTransmitting = true; 
+                currentIndex = 0; 
+                startTime = Date.now(); 
+                startQrDisplay(); 
+                worker.terminate(); 
+                worker = null; 
+                console.log("All QR codes generated, starting transmission.");
             }
-
-            function createChunks() {
-                chunks = [];
-                const totalChunks = Math.ceil(fileBuffer.byteLength / PROTOCOL_CONFIG.PAYLOAD_SIZE);
-                for (let i = 0; i < totalChunks; i++) {
-                    const start = i * PROTOCOL_CONFIG.PAYLOAD_SIZE;
-                    const end = Math.min(start + PROTOCOL_CONFIG.PAYLOAD_SIZE, fileBuffer.byteLength);
-                    const chunkData = fileBuffer.slice(start, end);
-
-                    // ArrayBufferをBase64に変換
-                    const base64Data = btoa(String.fromCharCode.apply(null, new Uint8Array(chunkData)));
-
-                    const chunkObject = {
-                        i: i,
-                        t: totalChunks,
-                        d: base64Data
-                    };
-                    chunks.push(JSON.stringify(chunkObject));
-                }
+            else if(type==='error'){ 
+                console.error(message); 
+                stopTransmission(); 
+                statusText.textContent=`エラー: QR生成失敗`; 
             }
+        };
+        worker.postMessage({chunks:chunks, qrConfig:QR_CONFIG});
+        console.log("Worker message posted for QR generation");
+    }
 
-            async function generateAllQRCodes() {
-                qrCodeCache = [];
-                for (let i = 0; i < chunks.length; i++) {
-                    const jsonChunk = chunks[i];
-                    try {
-                        const qr = qrcode(QR_CONFIG.TYPE_NUMBER, QR_CONFIG.ERROR_CORRECTION_LEVEL);
-                        qr.addData(jsonChunk);
-                        qr.make();
-                        qrCodeCache.push(qr.createImgTag(6, 4));
-
-                        // UI更新が頻繁すぎると遅くなるため、10個ごと、または最後に更新
-                        if (i % 10 === 0 || i === chunks.length - 1) {
-                            statusText.textContent = `QRコードを生成中... (${i + 1}/${chunks.length})`;
-                            // UIが更新されるように、イベントループに制御を一時的に返す
-                            await new Promise(resolve => setTimeout(resolve, 0));
-                        }
-                    } catch (e) {
-                        console.error("QRコード生成エラー:", e);
-                        console.error("データ:", jsonChunk);
-                        stopTransmission();
-                        statusText.textContent = `エラー: QRコードが大きすぎます。PAYLOAD_SIZEを小さくしてください。`;
-                        throw e; // Promiseをrejectさせる
-                    }
-                }
+    function startQrDisplay(){
+        if(transmissionIntervalId) clearInterval(transmissionIntervalId);
+        transmissionIntervalId = setInterval(()=>{
+            if(!isTransmitting) return;
+            if(currentIndex>=chunks.length){
+                const elapsed=(Date.now()-startTime)/1000;
+                const totalBits=base64Data.length*6;
+                bitrateText.textContent=`転送速度: ${(totalBits/elapsed/1000).toFixed(2)} kbps`;
+                currentIndex=0; startTime=Date.now();
             }
+            qrcodeContainer.innerHTML = qrCodeCache[currentIndex];
+            statusText.textContent = `${currentIndex+1}/${chunks.length} 送信中...`;
+            console.log(`Displaying QR ${currentIndex+1}/${chunks.length}, data length=${chunks[currentIndex].length}`);
+            currentIndex++;
+        }, PROTOCOL_CONFIG.TRANSMISSION_INTERVAL);
+    }
 
-            function startQrDisplay() {
-                if (transmissionIntervalId) {
-                    clearInterval(transmissionIntervalId);
-                }
-
-                transmissionIntervalId = setInterval(() => {
-                    if (!isTransmitting) return;
-
-                    if (currentIndex >= chunks.length) {
-                        // 1サイクル完了
-                        const elapsedTime = (Date.now() - startTime) / 1000; // seconds
-                        const totalBits = fileBuffer.byteLength * 8;
-                        const kbps = (totalBits / elapsedTime) / 1000;
-                        bitrateText.textContent = `転送速度: ${kbps.toFixed(2)} kbps`;
-                        
-                        // ループするのでリセット
-                        currentIndex = 0;
-                        startTime = Date.now();
-                    }
-
-                    qrcodeContainer.innerHTML = qrCodeCache[currentIndex];
-                    statusText.textContent = `${currentIndex + 1}/${chunks.length} 送信中...`;
-                    currentIndex++;
-
-                }, PROTOCOL_CONFIG.TRANSMISSION_INTERVAL);
-            }
-        });
-    </script>
+});
+</script>
 </body>
 </html>

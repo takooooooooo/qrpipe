@@ -1,7 +1,7 @@
 
 const PROTOCOL_CONFIG = {
-    PAYLOAD_SIZE: 1500,
-    TRANSMISSION_INTERVAL: 500,
+    PAYLOAD_SIZE: 1800,
+            TRANSMISSION_INTERVAL: 500, // 送信側がQRコードを切り替える時間間隔(ミリ秒)
 };
 
 const QR_CONFIG = {

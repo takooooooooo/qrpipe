@@ -110,13 +110,9 @@
             
             let workerPool = [];
             let isWorkerBusy = [];
-            const workerCount = 4;
+            const workerCount = 16;
             let startTime = 0;
             let receivedFileName = 'downloaded_file'; // デフォルトファイル名
-
-            // ★ 追加: FPS制御用
-            let lastScanTime = 0;
-            const SCAN_INTERVAL = 100; // ms → 約10FPS
 
             function startScan() {
                 log(`Worker数: ${workerCount} を初期化中...`);
@@ -137,7 +133,7 @@
                     workerPool.push(worker);
                 });
 
-                navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 800 }, height: { ideal: 800 } } })
+                navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } })
                     .then(mediaStream => {
                         stream = mediaStream;
                         video.srcObject = stream;
@@ -157,26 +153,21 @@
             }
 
             function tick(context, canvas) {
-                const now = performance.now();
-                if (now - lastScanTime < SCAN_INTERVAL) {
-                    animationFrameId = requestAnimationFrame(() => tick(context, canvas));
-                    return;
-                }
-                lastScanTime = now;
-
                 if (video.readyState === video.HAVE_ENOUGH_DATA) {
                     const freeWorkerIndex = isWorkerBusy.findIndex(busy => !busy);
                     if (freeWorkerIndex !== -1) {
                         isWorkerBusy[freeWorkerIndex] = true;
                         context.drawImage(video, 0, 0, canvas.width, canvas.height);
                         const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                        const copy = new Uint8ClampedArray(imageData.data);
-                        // workerPool[freeWorkerIndex].postMessage(imageData, [imageData.data.buffer]);
-                        workerPool[freeWorkerIndex].postMessage({
-                            data: copy,
-                            width: imageData.width,
-                            height: imageData.height
-                        });
+
+                        // コピーしてWorkerに送信（Transferではなくコピー）
+                        const copiedImageData = new ImageData(
+                            new Uint8ClampedArray(imageData.data),
+                            imageData.width,
+                            imageData.height
+                        );
+                        log(`Sending ImageData to worker ${freeWorkerIndex}. width=${copiedImageData.width}, height=${copiedImageData.height}`);
+                        workerPool[freeWorkerIndex].postMessage(imageData, [imageData.data.buffer]);
 
                     }
                 }
@@ -188,6 +179,7 @@
             function handleQrCode(data) {
                 try {
                     log(`handleQrCode received data length=${data.length}`);
+                    log(`handleQrCode raw data=${data.substring(0,100)}...`);
                     const chunk = JSON.parse(data);
                     if (typeof chunk.i !== 'number' || typeof chunk.t !== 'number' || typeof chunk.d !== 'string' || typeof chunk.c !== 'number') {
                         return;
@@ -204,6 +196,7 @@
                         log(`受信開始: 総チャンク数 ${totalChunks}`);
                     }
 
+                    // ファイル名がまだ設定されていなければ、このチャンクから取得を試みる
                     if (receivedFileName === 'downloaded_file' && typeof chunk.n === 'string') {
                         receivedFileName = chunk.n;
                         log(`ファイル名取得: ${receivedFileName}`);
@@ -253,7 +246,7 @@
                     try {
                         const fullBase64 = receivedChunks.join('');
                         const fileData = base64ToUint8Array(fullBase64);
-                        const blob = new Blob([fileData]);
+                        const blob = new Blob([fileData]); // ★送信側に合わせてMIMEを設定可能
                         const url = URL.createObjectURL(blob);
 
                         const elapsedTime = (endTime - startTime) / 1000;
@@ -262,7 +255,7 @@
 
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = receivedFileName;
+                        a.download = receivedFileName; // 受信したファイル名を設定
                         a.textContent = 'ファイルをダウンロード';
                         downloadContainer.innerHTML = '';
                         downloadContainer.appendChild(a);
